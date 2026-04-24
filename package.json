@@ -1,0 +1,31 @@
+{
+  "name": "face-geometry-scorer",
+  "version": "0.1.0",
+  "description": "Client-side facial geometry and skin analysis using MediaPipe Face Mesh. Scores symmetry, proportions, jawline, skin texture, and more — entirely in the browser.",
+  "type": "module",
+  "main": "src/analyze.ts",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mediapipe/camera_utils": "^0.3.1675466862",
+    "@mediapipe/face_mesh": "^0.4.1633559619"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  },
+  "license": "MIT",
+  "author": "Paris Dong",
+  "keywords": [
+    "face-analysis",
+    "facial-geometry",
+    "mediapipe",
+    "face-mesh",
+    "skin-analysis",
+    "computer-vision",
+    "browser-ml"
+  ]
+}
