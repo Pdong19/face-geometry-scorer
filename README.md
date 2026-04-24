@@ -162,7 +162,17 @@ const customWeights = {
 const customScore = computeCompositeScore(result.geometry, result.skin, customWeights);
 ```
 
-A working demo is included at [`examples/demo.html`](examples/demo.html) -- open it in a browser to score faces from an uploaded image.
+### Demo
+
+Open [`examples/demo.html`](examples/demo.html) in a browser to try it. The demo loads MediaPipe from CDN, detects face landmarks, and computes geometry scores (symmetry, proportions, jawline, thirds, eyes) in real-time.
+
+> **Note:** The demo runs geometry scoring standalone. Skin analysis (CIELAB color uniformity, Laplacian texture, blemish detection, dark circles, luminosity) requires pixel-level image processing from the full TypeScript modules. To get all 11 subscores, integrate the library into your project with a bundler like Vite or esbuild:
+>
+> ```bash
+> npm install
+> # import { analyzeFace } from './src/analyze' in your app
+> # bundle with: npx vite build
+> ```
 
 ## Tests
 
