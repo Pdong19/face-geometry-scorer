@@ -1,8 +1,8 @@
 # Face Geometry Scorer
 
+[![Tests](https://github.com/Pdong19/face-geometry-scorer/actions/workflows/tests.yml/badge.svg)](https://github.com/Pdong19/face-geometry-scorer/actions)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue.svg)](https://www.typescriptlang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Zero Dependencies](https://img.shields.io/badge/runtime_deps-0-brightgreen.svg)](#)
 
 Client-side facial geometry and skin analysis using MediaPipe Face Mesh. Computes 11 subscores across 6 categories from 468 3D facial landmarks, entirely in the browser with no server-side processing.
 
@@ -103,22 +103,75 @@ npm install
 
 ## Usage
 
+`analyzeFace()` takes an [`ImageData`](https://developer.mozilla.org/en-US/docs/Web/API/ImageData) object and returns scores across all 11 dimensions:
+
 ```typescript
-import { analyzeFace } from './src/analyze';
+import { analyzeFace, FaceNotFoundError } from './src/analyze';
 
+// From a video frame
 const video = document.querySelector('video');
-const result = await analyzeFace(video);
+const canvas = document.createElement('canvas');
+canvas.width = video.videoWidth;
+canvas.height = video.videoHeight;
+const ctx = canvas.getContext('2d');
+ctx.drawImage(video, 0, 0);
+const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
-console.log(result.overall);        // 7.2 (1.0 - 10.0 scale)
-console.log(result.geometry);       // { symmetry, proportions, jawline, facialThirds, eyeMetrics }
-console.log(result.skin);           // { colorUniformity, texture, blemishes, darkCircles, luminosity }
-console.log(result.subscoreStdDev); // 8.3 (lower = more consistent across dimensions)
+try {
+  const result = await analyzeFace(imageData);
+
+  // Composite score (1.0 - 10.0 scale)
+  console.log(result.composite.overall);  // 7.2
+
+  // Geometry subscores (0 - 100 each)
+  console.log(result.geometry.symmetry);       // 82
+  console.log(result.geometry.proportions);    // 71
+  console.log(result.geometry.jawline);        // 65
+  console.log(result.geometry.facialThirds);   // 78
+  console.log(result.geometry.eyeMetrics);     // 74
+
+  // Skin subscores (0 - 100 each)
+  console.log(result.skin.colorUniformity);    // 88
+  console.log(result.skin.textureRoughness);   // 79
+  console.log(result.skin.blemishDensity);     // 91
+  console.log(result.skin.darkCircles);        // 72
+  console.log(result.skin.luminosity);         // 85
+
+  // Raw 468-point landmarks available for visualization
+  console.log(result.landmarks.length);        // 468
+} catch (e) {
+  if (e instanceof FaceNotFoundError) {
+    console.log('No face detected in the image');
+  }
+}
 ```
+
+### Custom Weights
+
+Override the default scoring weights to prioritize different features:
+
+```typescript
+import { computeCompositeScore, DEFAULT_WEIGHTS } from './src/composite';
+
+const customWeights = {
+  ...DEFAULT_WEIGHTS,
+  symmetry: 0.25,    // prioritize symmetry
+  skinClarity: 0.10, // de-prioritize skin
+};
+
+const customScore = computeCompositeScore(result.geometry, result.skin, customWeights);
+```
+
+A working demo is included at [`examples/demo.html`](examples/demo.html) -- open it in a browser to score faces from an uploaded image.
 
 ## Tests
 
 ```bash
+# Run all 40 tests
 npm test
+
+# Type check
+npx tsc --noEmit
 ```
 
 ## Technical Details

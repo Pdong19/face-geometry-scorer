@@ -43,25 +43,45 @@ import { clamp } from "./utils";
  * - ~25% score 3-4
  * - ~5% score 1-2
  */
+export interface ScoringWeights {
+  symmetry: number;
+  proportions: number;
+  skinClarity: number;
+  jawline: number;
+  eyeMetrics: number;
+  facialThirds: number;
+  darkCircles: number;
+  luminosity: number;
+}
+
+export const DEFAULT_WEIGHTS: ScoringWeights = {
+  symmetry: 0.16,
+  proportions: 0.16,
+  skinClarity: 0.19,
+  jawline: 0.14,
+  eyeMetrics: 0.13,
+  facialThirds: 0.08,
+  darkCircles: 0.07,
+  luminosity: 0.07,
+};
+
 export function computeCompositeScore(
   geometry: GeometryScores,
   skin: SkinScores,
+  weights: ScoringWeights = DEFAULT_WEIGHTS,
 ): CompositeScore {
-  // Skin clarity = average of the three texture/color metrics
   const skinClarity =
     (skin.colorUniformity + skin.textureRoughness + skin.blemishDensity) / 3;
 
-  // Weighted raw score (0-100 scale) — updated 2026-03-24
-  // Skin metrics boosted from 27% to 33% total; symmetry reduced from 22% to 16%
   const raw =
-    geometry.symmetry * 0.16 +
-    geometry.proportions * 0.16 +
-    skinClarity * 0.19 +
-    geometry.jawline * 0.14 +
-    geometry.eyeMetrics * 0.13 +
-    geometry.facialThirds * 0.08 +
-    skin.darkCircles * 0.07 +
-    skin.luminosity * 0.07;
+    geometry.symmetry * weights.symmetry +
+    geometry.proportions * weights.proportions +
+    skinClarity * weights.skinClarity +
+    geometry.jawline * weights.jawline +
+    geometry.eyeMetrics * weights.eyeMetrics +
+    geometry.facialThirds * weights.facialThirds +
+    skin.darkCircles * weights.darkCircles +
+    skin.luminosity * weights.luminosity;
 
   // --- Consistency penalty ---
   // Penalise high variance across subscores. Someone with 90 symmetry but

@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Face Geometry Scorer - Demo</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0a; color: #e0e0e0; min-height: 100vh; padding: 2rem; }
+    h1 { font-size: 1.5rem; margin-bottom: 0.5rem; }
+    .subtitle { color: #888; margin-bottom: 2rem; }
+    .container { max-width: 900px; margin: 0 auto; }
+    .input-section { display: flex; gap: 1rem; margin-bottom: 2rem; flex-wrap: wrap; }
+    button { padding: 0.75rem 1.5rem; border: 1px solid #333; background: #1a1a1a; color: #e0e0e0; border-radius: 8px; cursor: pointer; font-size: 0.9rem; }
+    button:hover { background: #2a2a2a; border-color: #555; }
+    .preview { display: flex; gap: 2rem; flex-wrap: wrap; margin-bottom: 1rem; }
+    .preview canvas { max-width: 400px; border-radius: 8px; border: 1px solid #333; }
+    .results { margin-top: 2rem; }
+    .score-card { background: #1a1a1a; border: 1px solid #333; border-radius: 12px; padding: 1.5rem; margin-bottom: 1rem; }
+    .overall { font-size: 3rem; font-weight: 700; text-align: center; margin: 1rem 0; }
+    .score-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    .score-group h3 { font-size: 0.85rem; text-transform: uppercase; color: #888; margin-bottom: 0.75rem; letter-spacing: 0.05em; }
+    .score-row { display: flex; justify-content: space-between; align-items: center; padding: 0.4rem 0; border-bottom: 1px solid #222; }
+    .score-row:last-child { border: none; }
+    .score-label { font-size: 0.85rem; }
+    .bar-bg { width: 80px; height: 6px; background: #222; border-radius: 3px; margin-left: 0.5rem; }
+    .bar-fill { height: 100%; border-radius: 3px; }
+    .status { padding: 1rem; text-align: center; color: #888; }
+    .loading { animation: pulse 1.5s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+    input[type="file"] { display: none; }
+    .note { margin-top: 2rem; padding: 1rem; border: 1px solid #333; border-radius: 8px; background: #111; color: #888; font-size: 0.8rem; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Face Geometry Scorer</h1>
+    <p class="subtitle">Client-side facial analysis using MediaPipe Face Mesh (468 3D landmarks). Nothing is uploaded.</p>
+
+    <div class="input-section">
+      <button id="btn-upload">Upload Image</button>
+      <input type="file" id="file-input" accept="image/*">
+    </div>
+
+    <div class="preview">
+      <canvas id="preview-canvas" style="display:none"></canvas>
+    </div>
+
+    <div id="status" class="status" style="display:none"></div>
+
+    <div id="results" class="results" style="display:none">
+      <div class="score-card">
+        <div style="text-align:center; color:#888; font-size:0.85rem; text-transform:uppercase; letter-spacing:0.05em;">Composite Score</div>
+        <div id="overall-score" class="overall">--</div>
+      </div>
+      <div class="score-grid">
+        <div class="score-group">
+          <h3>Geometry</h3>
+          <div id="geometry-scores"></div>
+        </div>
+        <div class="score-group">
+          <h3>Skin</h3>
+          <div id="skin-scores"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="note">
+      <strong>Demo Note:</strong> This standalone HTML demo loads MediaPipe Face Mesh from CDN and runs landmark detection.
+      The full scoring library (geometry.ts, skin-analysis.ts, composite.ts) requires a bundler like Vite or esbuild
+      to compile the TypeScript modules. See the README for integration instructions.
+    </div>
+  </div>
+
+  <script type="module">
+    const CDN = "https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/";
+    let faceMesh = null;
+
+    async function loadModel() {
+      if (faceMesh) return faceMesh;
+      const script = document.createElement('script');
+      script.src = CDN + "face_mesh.js";
+      document.head.appendChild(script);
+      await new Promise(r => { script.onload = r; });
+
+      faceMesh = new window.FaceMesh({ locateFile: f => CDN + f });
+      faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+      await faceMesh.initialize();
+      return faceMesh;
+    }
+
+    function setStatus(msg, loading = false) {
+      const el = document.getElementById('status');
+      el.style.display = 'block';
+      el.textContent = msg;
+      el.className = loading ? 'status loading' : 'status';
+    }
+
+    function addScoreRow(container, label, value) {
+      const row = document.createElement('div');
+      row.className = 'score-row';
+
+      const labelSpan = document.createElement('span');
+      labelSpan.className = 'score-label';
+      labelSpan.textContent = label;
+
+      const inner = document.createElement('div');
+      inner.style.cssText = 'display:flex;align-items:center;gap:0.5rem';
+
+      const valueSpan = document.createElement('span');
+      valueSpan.className = 'score-value';
+      valueSpan.textContent = String(value);
+
+      const barBg = document.createElement('div');
+      barBg.className = 'bar-bg';
+      const barFill = document.createElement('div');
+      barFill.className = 'bar-fill';
+      barFill.style.width = value + '%';
+      barFill.style.background = value >= 70 ? '#4ade80' : value >= 40 ? '#facc15' : '#f87171';
+      barBg.appendChild(barFill);
+
+      inner.appendChild(valueSpan);
+      inner.appendChild(barBg);
+      row.appendChild(labelSpan);
+      row.appendChild(inner);
+      container.appendChild(row);
+    }
+
+    function renderScores(landmarks) {
+      document.getElementById('results').style.display = 'block';
+
+      // Compute geometry scores from landmarks
+      const geo = computeGeometry(landmarks);
+      const skin = { colorUniformity: 0, textureRoughness: 0, blemishDensity: 0, darkCircles: 0, luminosity: 0 };
+
+      // Composite (geometry only in demo -- skin requires pixel extraction from full library)
+      const geoAvg = Math.round((geo.symmetry + geo.proportions + geo.jawline + geo.facialThirds + geo.eyeMetrics) / 5);
+      const sigmoid = 1 / (1 + Math.exp(-0.10 * (geoAvg - 68)));
+      const overall = (1 + sigmoid * 9).toFixed(1);
+      document.getElementById('overall-score').textContent = overall;
+
+      const geoEl = document.getElementById('geometry-scores');
+      const skinEl = document.getElementById('skin-scores');
+      geoEl.replaceChildren();
+      skinEl.replaceChildren();
+
+      addScoreRow(geoEl, 'Symmetry', geo.symmetry);
+      addScoreRow(geoEl, 'Proportions', geo.proportions);
+      addScoreRow(geoEl, 'Jawline', geo.jawline);
+      addScoreRow(geoEl, 'Facial Thirds', geo.facialThirds);
+      addScoreRow(geoEl, 'Eye Metrics', geo.eyeMetrics);
+
+      // Skin requires pixel-level analysis (full library needed)
+      const skinNote = document.createElement('div');
+      skinNote.style.cssText = 'color:#666;font-size:0.8rem;padding:0.5rem 0';
+      skinNote.textContent = 'Skin analysis requires the full TypeScript library (pixel-level CIELAB + Laplacian processing).';
+      skinEl.appendChild(skinNote);
+    }
+
+    // Simplified geometry scoring from raw landmarks (mirrors geometry.ts logic)
+    function computeGeometry(lm) {
+      function dist(a, b) {
+        return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
+      }
+      function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+      // Symmetry: compare left/right paired distances
+      const pairs = [[234, 454], [130, 359], [33, 263], [61, 291], [172, 397]];
+      let symSum = 0;
+      for (const [l, r] of pairs) {
+        const dL = dist(lm[l], lm[4]); // distance to nose tip
+        const dR = dist(lm[r], lm[4]);
+        const ratio = Math.min(dL, dR) / Math.max(dL, dR);
+        symSum += ratio;
+      }
+      const symmetry = clamp(Math.round((symSum / pairs.length) * 100), 0, 100);
+
+      // Proportions: face width/height ratio vs golden ratio
+      const faceW = dist(lm[234], lm[454]);
+      const faceH = dist(lm[10], lm[152]);
+      const ratio = faceH / faceW;
+      const goldenDev = Math.abs(ratio - 1.618);
+      const proportions = clamp(Math.round((1 - goldenDev / 0.5) * 100), 0, 100);
+
+      // Jawline: angle at jaw corners
+      const jawL = lm[172], jawR = lm[397], chin = lm[152];
+      const angle = Math.atan2(chin.y - jawL.y, chin.x - jawL.x) - Math.atan2(jawR.y - jawL.y, jawR.x - jawL.x);
+      const angleDeg = Math.abs(angle * 180 / Math.PI);
+      const jawline = clamp(Math.round(100 - Math.abs(angleDeg - 120) * 1.5), 0, 100);
+
+      // Facial thirds
+      const topY = lm[10].y, midY = lm[4].y, botY = lm[152].y;
+      const upper = midY - topY, lower = botY - midY;
+      const thirdsRatio = Math.min(upper, lower) / Math.max(upper, lower);
+      const facialThirds = clamp(Math.round(thirdsRatio * 100), 0, 100);
+
+      // Eye metrics: width/height ratio
+      const eyeW = dist(lm[33], lm[133]);
+      const eyeH = dist(lm[159], lm[145]);
+      const eyeRatio = eyeW / Math.max(eyeH, 0.001);
+      const eyeMetrics = clamp(Math.round(100 - Math.abs(eyeRatio - 3.0) * 15), 0, 100);
+
+      return { symmetry, proportions, jawline, facialThirds, eyeMetrics };
+    }
+
+    // Upload handler
+    document.getElementById('btn-upload').addEventListener('click', () => {
+      document.getElementById('file-input').click();
+    });
+
+    document.getElementById('file-input').addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      setStatus('Loading MediaPipe Face Mesh model...', true);
+      const model = await loadModel();
+
+      const img = new Image();
+      img.src = URL.createObjectURL(file);
+      await new Promise(r => { img.onload = r; });
+
+      const canvas = document.getElementById('preview-canvas');
+      canvas.style.display = 'block';
+      canvas.width = img.width;
+      canvas.height = img.height;
+      canvas.getContext('2d').drawImage(img, 0, 0);
+
+      setStatus('Detecting face landmarks (468 points)...', true);
+
+      model.onResults((results) => {
+        if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+          const landmarks = results.multiFaceLandmarks[0];
+          setStatus('Scoring geometry (symmetry, proportions, jawline, thirds, eyes)...');
+          setTimeout(() => renderScores(landmarks), 100);
+        } else {
+          setStatus('No face detected. Try a clearer photo with good lighting and a front-facing angle.');
+        }
+      });
+      model.send({ image: canvas });
+    });
+  </script>
+</body>
+</html>
