@@ -23,19 +23,24 @@
     .score-row { display: flex; justify-content: space-between; align-items: center; padding: 0.4rem 0; border-bottom: 1px solid #222; }
     .score-row:last-child { border: none; }
     .score-label { font-size: 0.85rem; }
+    .score-value { font-size: 0.85rem; font-weight: 600; min-width: 28px; text-align: right; }
     .bar-bg { width: 80px; height: 6px; background: #222; border-radius: 3px; margin-left: 0.5rem; }
-    .bar-fill { height: 100%; border-radius: 3px; }
+    .bar-fill { height: 100%; border-radius: 3px; transition: width 0.4s ease; }
     .status { padding: 1rem; text-align: center; color: #888; }
     .loading { animation: pulse 1.5s infinite; }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
     input[type="file"] { display: none; }
     .note { margin-top: 2rem; padding: 1rem; border: 1px solid #333; border-radius: 8px; background: #111; color: #888; font-size: 0.8rem; line-height: 1.5; }
+    @media (max-width: 600px) {
+      .score-grid { grid-template-columns: 1fr; }
+      body { padding: 1rem; }
+    }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>Face Geometry Scorer</h1>
-    <p class="subtitle">Client-side facial analysis using MediaPipe Face Mesh (468 3D landmarks). Nothing is uploaded.</p>
+    <p class="subtitle">Client-side facial analysis using MediaPipe Face Mesh (468 3D landmarks).</p>
 
     <div class="input-section">
       <button id="btn-upload">Upload Image</button>
@@ -66,13 +71,675 @@
     </div>
 
     <div class="note">
-      <strong>Demo Note:</strong> This standalone HTML demo loads MediaPipe Face Mesh from CDN and runs landmark detection.
-      The full scoring library (geometry.ts, skin-analysis.ts, composite.ts) requires a bundler like Vite or esbuild
-      to compile the TypeScript modules. See the README for integration instructions.
+      All analysis runs client-side. No images are uploaded.
     </div>
   </div>
 
   <script type="module">
+    // =========================================================================
+    // UTILITY
+    // =========================================================================
+
+    function clamp(value, min, max) {
+      return Math.max(min, Math.min(max, value));
+    }
+
+    function dist2D(a, b) {
+      return Math.hypot(a.x - b.x, a.y - b.y);
+    }
+
+    function angleDeg(a, b, c) {
+      const ba = { x: a.x - b.x, y: a.y - b.y };
+      const bc = { x: c.x - b.x, y: c.y - b.y };
+      const dot = ba.x * bc.x + ba.y * bc.y;
+      const magBA = Math.hypot(ba.x, ba.y);
+      const magBC = Math.hypot(bc.x, bc.y);
+      if (magBA === 0 || magBC === 0) return 0;
+      const cosAngle = clamp(dot / (magBA * magBC), -1, 1);
+      return Math.acos(cosAngle) * (180 / Math.PI);
+    }
+
+    // =========================================================================
+    // COLOR SCIENCE  (color-science.ts transpiled)
+    // =========================================================================
+
+    /** sRGB (0-255) -> CIELAB. Pipeline: sRGB -> linear RGB -> XYZ (D65) -> Lab */
+    function rgbToLab(r, g, b) {
+      let rLin = r / 255;
+      let gLin = g / 255;
+      let bLin = b / 255;
+
+      rLin = rLin > 0.04045 ? Math.pow((rLin + 0.055) / 1.055, 2.4) : rLin / 12.92;
+      gLin = gLin > 0.04045 ? Math.pow((gLin + 0.055) / 1.055, 2.4) : gLin / 12.92;
+      bLin = bLin > 0.04045 ? Math.pow((bLin + 0.055) / 1.055, 2.4) : bLin / 12.92;
+
+      const x = (rLin * 0.4124564 + gLin * 0.3575761 + bLin * 0.1804375) / 0.95047;
+      const y = rLin * 0.2126729 + gLin * 0.7151522 + bLin * 0.0721750;
+      const z = (rLin * 0.0193339 + gLin * 0.1191920 + bLin * 0.9503041) / 1.08883;
+
+      const epsilon = 0.008856;
+      const kappa = 903.3;
+
+      const fx = x > epsilon ? Math.cbrt(x) : (kappa * x + 16) / 116;
+      const fy = y > epsilon ? Math.cbrt(y) : (kappa * y + 16) / 116;
+      const fz = z > epsilon ? Math.cbrt(z) : (kappa * z + 16) / 116;
+
+      return {
+        L: 116 * fy - 16,
+        a: 500 * (fx - fy),
+        b: 200 * (fy - fz),
+      };
+    }
+
+    /** sRGB (0-255) -> HSV. H: 0-360, S: 0-1, V: 0-1 */
+    function rgbToHsv(r, g, b) {
+      const rn = r / 255;
+      const gn = g / 255;
+      const bn = b / 255;
+
+      const max = Math.max(rn, gn, bn);
+      const min = Math.min(rn, gn, bn);
+      const delta = max - min;
+
+      let h = 0;
+      if (delta > 0) {
+        if (max === rn) {
+          h = 60 * (((gn - bn) / delta) % 6);
+        } else if (max === gn) {
+          h = 60 * ((bn - rn) / delta + 2);
+        } else {
+          h = 60 * ((rn - gn) / delta + 4);
+        }
+      }
+      if (h < 0) h += 360;
+
+      const s = max === 0 ? 0 : delta / max;
+      return { h, s, v: max };
+    }
+
+    // =========================================================================
+    // WHITE BALANCE  (color-science.ts -- Von Kries chromatic adaptation)
+    // =========================================================================
+
+    function averageRgb(region) {
+      if (region.count === 0) return { r: 128, g: 128, b: 128 };
+      let rSum = 0, gSum = 0, bSum = 0;
+      for (let i = 0; i < region.pixels.length; i += 4) {
+        rSum += region.pixels[i];
+        gSum += region.pixels[i + 1];
+        bSum += region.pixels[i + 2];
+      }
+      return { r: rSum / region.count, g: gSum / region.count, b: bSum / region.count };
+    }
+
+    function computeWhiteBalanceScales(reference) {
+      const avg = averageRgb(reference);
+      if (avg.r < 5 || avg.g < 5 || avg.b < 5) return null;
+      return { r: 128 / avg.r, g: 128 / avg.g, b: 128 / avg.b };
+    }
+
+    function applyWhiteBalance(region, scales) {
+      const pixels = region.pixels;
+      for (let i = 0; i < pixels.length; i += 4) {
+        pixels[i]     = Math.min(255, Math.round(pixels[i]     * scales.r));
+        pixels[i + 1] = Math.min(255, Math.round(pixels[i + 1] * scales.g));
+        pixels[i + 2] = Math.min(255, Math.round(pixels[i + 2] * scales.b));
+      }
+    }
+
+    // =========================================================================
+    // SKIN REGIONS  (skin-regions.ts transpiled)
+    // =========================================================================
+
+    const FOREHEAD_INDICES = [
+      10, 338, 297, 332, 284, 251, 389, 356, 454,
+      234, 127, 162, 21, 54, 103, 67, 109,
+    ];
+
+    const LEFT_CHEEK_POLY = [
+      116, 123, 132, 58, 172, 150, 176, 148,
+      49, 48, 115,
+    ];
+
+    const RIGHT_CHEEK_POLY = [
+      345, 352, 361, 288, 397, 379, 400, 377,
+      279, 278, 344,
+    ];
+
+    const CHIN_INDICES = [
+      379, 378, 400, 377, 152, 148, 176, 149, 150,
+    ];
+
+    const UNDER_EYE_LEFT_INDICES = [
+      111, 117, 118, 119, 120, 121, 128, 245, 193, 122,
+    ];
+
+    const UNDER_EYE_RIGHT_INDICES = [
+      340, 346, 347, 348, 349, 350, 357, 465, 417, 351,
+    ];
+
+    /** Point-in-polygon via ray casting. */
+    function pointInPolygon(px, py, polygon) {
+      let inside = false;
+      const n = polygon.length;
+      for (let i = 0, j = n - 1; i < n; j = i++) {
+        const xi = polygon[i].x, yi = polygon[i].y;
+        const xj = polygon[j].x, yj = polygon[j].y;
+        if (yi > py !== yj > py && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) {
+          inside = !inside;
+        }
+      }
+      return inside;
+    }
+
+    /** Extract pixel data within a landmark polygon. */
+    function extractRegion(landmarks, imageData, indices) {
+      const w = imageData.width;
+      const h = imageData.height;
+      const data = imageData.data;
+
+      const polygon = indices.map(i => ({
+        x: landmarks[i].x * w,
+        y: landmarks[i].y * h,
+      }));
+
+      let minX = w, minY = h, maxX = 0, maxY = 0;
+      for (const p of polygon) {
+        if (p.x < minX) minX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y > maxY) maxY = p.y;
+      }
+      minX = Math.max(0, Math.floor(minX));
+      minY = Math.max(0, Math.floor(minY));
+      maxX = Math.min(w - 1, Math.ceil(maxX));
+      maxY = Math.min(h - 1, Math.ceil(maxY));
+
+      const boxW = maxX - minX + 1;
+      const boxH = maxY - minY + 1;
+      const maxPixels = boxW * boxH;
+      const buffer = new Uint8ClampedArray(maxPixels * 4);
+      const mask = new Uint8Array(maxPixels);
+      let writeIdx = 0;
+
+      for (let row = minY; row <= maxY; row++) {
+        for (let col = minX; col <= maxX; col++) {
+          if (pointInPolygon(col, row, polygon)) {
+            const srcIdx = (row * w + col) * 4;
+            buffer[writeIdx]     = data[srcIdx];
+            buffer[writeIdx + 1] = data[srcIdx + 1];
+            buffer[writeIdx + 2] = data[srcIdx + 2];
+            buffer[writeIdx + 3] = data[srcIdx + 3];
+            writeIdx += 4;
+            mask[(row - minY) * boxW + (col - minX)] = 1;
+          }
+        }
+      }
+
+      const pixelCount = writeIdx / 4;
+      return {
+        pixels: buffer.subarray(0, writeIdx),
+        count: pixelCount,
+        width: boxW,
+        height: boxH,
+        mask,
+      };
+    }
+
+    /** Extract all 6 skin regions from face landmarks + image data. */
+    function extractSkinRegions(landmarks, imageData) {
+      return {
+        forehead:      extractRegion(landmarks, imageData, FOREHEAD_INDICES),
+        leftCheek:     extractRegion(landmarks, imageData, LEFT_CHEEK_POLY),
+        rightCheek:    extractRegion(landmarks, imageData, RIGHT_CHEEK_POLY),
+        chin:          extractRegion(landmarks, imageData, CHIN_INDICES),
+        underEyeLeft:  extractRegion(landmarks, imageData, UNDER_EYE_LEFT_INDICES),
+        underEyeRight: extractRegion(landmarks, imageData, UNDER_EYE_RIGHT_INDICES),
+      };
+    }
+
+    // =========================================================================
+    // SKIN ANALYSIS  (skin-analysis.ts transpiled)
+    // =========================================================================
+
+    /** Average CIELAB L* (lightness) across a region's pixels. */
+    function averageLightness(region) {
+      if (region.count === 0) return 0;
+      let totalL = 0;
+      for (let i = 0; i < region.pixels.length; i += 4) {
+        totalL += rgbToLab(region.pixels[i], region.pixels[i + 1], region.pixels[i + 2]).L;
+      }
+      return totalL / region.count;
+    }
+
+    /** O(n) histogram median. */
+    function histogramMedian(bins, total) {
+      const half = total / 2;
+      let cumulative = 0;
+      for (let i = 0; i < bins.length; i++) {
+        cumulative += bins[i];
+        if (cumulative >= half) return i;
+      }
+      return bins.length - 1;
+    }
+
+    /**
+     * Color uniformity: CIELAB std dev across region.
+     * Lower std dev = more uniform = higher score.
+     */
+    function computeColorUniformity(region) {
+      if (region.count === 0) return 50;
+
+      let sumL = 0, sumL2 = 0, sumA = 0, sumA2 = 0, sumB = 0, sumB2 = 0;
+      let n = 0;
+
+      for (let i = 0; i < region.pixels.length; i += 4) {
+        const lab = rgbToLab(region.pixels[i], region.pixels[i + 1], region.pixels[i + 2]);
+        sumL += lab.L; sumL2 += lab.L * lab.L;
+        sumA += lab.a; sumA2 += lab.a * lab.a;
+        sumB += lab.b; sumB2 += lab.b * lab.b;
+        n++;
+      }
+
+      if (n === 0) return 50;
+
+      const stdL = Math.sqrt(Math.max(0, sumL2 / n - (sumL / n) ** 2));
+      const stdA = Math.sqrt(Math.max(0, sumA2 / n - (sumA / n) ** 2));
+      const stdB = Math.sqrt(Math.max(0, sumB2 / n - (sumB / n) ** 2));
+
+      const weightedStd = stdL * 0.5 + stdA * 0.25 + stdB * 0.25;
+      return clamp(Math.round(100 - weightedStd * 5.0), 0, 100);
+    }
+
+    /**
+     * Texture roughness via Laplacian edge detection variance.
+     * High variance = rough = lower score.
+     */
+    function computeTextureRoughness(region) {
+      if (region.count < 9 || region.width < 3 || region.height < 3) return 50;
+
+      const { pixels, width, height, mask } = region;
+
+      // Build grayscale grid from the bounding box
+      const gray = new Float32Array(width * height);
+      let pixelIdx = 0;
+      for (let row = 0; row < height; row++) {
+        for (let col = 0; col < width; col++) {
+          const maskIdx = row * width + col;
+          if (mask[maskIdx]) {
+            const r = pixels[pixelIdx * 4];
+            const g = pixels[pixelIdx * 4 + 1];
+            const b = pixels[pixelIdx * 4 + 2];
+            gray[maskIdx] = 0.299 * r + 0.587 * g + 0.114 * b;
+            pixelIdx++;
+          }
+        }
+      }
+
+      if (pixelIdx !== region.count) return 50;
+
+      // 3x3 Laplacian kernel on interior pixels with full cardinal mask
+      let lapSum = 0, lapSumSq = 0, lapCount = 0;
+
+      for (let row = 1; row < height - 1; row++) {
+        for (let col = 1; col < width - 1; col++) {
+          const idx = row * width + col;
+          if (!mask[idx] || !mask[idx - 1] || !mask[idx + 1] ||
+              !mask[idx - width] || !mask[idx + width]) {
+            continue;
+          }
+          const lap = 4 * gray[idx] - gray[idx - 1] - gray[idx + 1] -
+                      gray[idx - width] - gray[idx + width];
+          lapSum += lap;
+          lapSumSq += lap * lap;
+          lapCount++;
+        }
+      }
+
+      if (lapCount === 0) return 50;
+
+      const variance = Math.max(0, lapSumSq / lapCount - (lapSum / lapCount) ** 2);
+
+      // Normalize by region resolution
+      const referenceDensity = 10000;
+      const bboxArea = region.width * region.height;
+      const densityRatio = bboxArea / referenceDensity;
+      const normFactor = clamp(Math.sqrt(densityRatio), 0.5, 2.0);
+      const normalizedVariance = variance / normFactor;
+
+      return clamp(Math.round(100 - normalizedVariance * 0.18), 0, 100);
+    }
+
+    /**
+     * Blemish density: HSV-based detection of inflamed spots and dark spots.
+     */
+    function computeBlemishDensity(region) {
+      if (region.count === 0) return 50;
+
+      const hBins = new Uint32Array(360);
+      const sBins = new Uint32Array(101);
+      const vBins = new Uint32Array(101);
+
+      const pixelCount = region.count;
+      const hArr = new Float32Array(pixelCount);
+      const sArr = new Float32Array(pixelCount);
+      const vArr = new Float32Array(pixelCount);
+
+      for (let i = 0, p = 0; i < region.pixels.length; i += 4, p++) {
+        const hsv = rgbToHsv(region.pixels[i], region.pixels[i + 1], region.pixels[i + 2]);
+        hArr[p] = hsv.h;
+        sArr[p] = hsv.s;
+        vArr[p] = hsv.v;
+        hBins[Math.min(359, Math.round(hsv.h))]++;
+        sBins[Math.min(100, Math.round(hsv.s * 100))]++;
+        vBins[Math.min(100, Math.round(hsv.v * 100))]++;
+      }
+
+      const medH = histogramMedian(hBins, pixelCount);
+      const medS = histogramMedian(sBins, pixelCount) / 100;
+      const medV = histogramMedian(vBins, pixelCount) / 100;
+
+      let blemishCount = 0;
+
+      for (let i = 0; i < pixelCount; i++) {
+        let hueDiff = Math.abs(hArr[i] - medH);
+        if (hueDiff > 180) hueDiff = 360 - hueDiff;
+
+        const isReddish = hArr[i] < 40 || hArr[i] > 340;
+        const isInflamed = isReddish && hueDiff > 15 && sArr[i] - medS > 0.08;
+        const isDarkSpot = medV - vArr[i] > 0.15;
+
+        if (isInflamed || isDarkSpot) blemishCount++;
+      }
+
+      const blemishRatio = blemishCount / region.count;
+      return clamp(Math.round(100 - blemishRatio * 500), 0, 100);
+    }
+
+    /**
+     * Dark circles: CIELAB L* delta between under-eye and cheek.
+     */
+    function computeDarkCircles(underEye, cheek, precomputedCheekAvgL) {
+      if (underEye.count === 0 || cheek.count === 0) return 50;
+      const underEyeL = averageLightness(underEye);
+      const cheekL = precomputedCheekAvgL !== undefined ? precomputedCheekAvgL : averageLightness(cheek);
+      const delta = Math.max(0, cheekL - underEyeL);
+      return clamp(Math.round(100 - delta * 5), 0, 100);
+    }
+
+    /**
+     * Luminosity: Gaussian bell curve on cheek L*.
+     * Centered at L* 65 -- both dark and light skin score equally when well-lit.
+     */
+    function computeLuminosity(cheek, precomputedAvgL) {
+      if (cheek.count === 0) return 50;
+      const avgL = precomputedAvgL !== undefined ? precomputedAvgL : averageLightness(cheek);
+      const center = 65;
+      const score = 100 * Math.exp(-0.00055 * (avgL - center) ** 2);
+      return clamp(Math.round(score), 0, 100);
+    }
+
+    // =========================================================================
+    // GEOMETRY  (geometry.ts transpiled -- full version with all sub-scorers)
+    // =========================================================================
+
+    const SYMMETRY_PAIRS = [
+      [33, 263], [133, 362], [159, 386], [145, 374],
+      [46, 276], [107, 336], [105, 334], [61, 291],
+      [48, 278], [98, 327], [116, 345], [123, 352],
+      [234, 454], [132, 361], [58, 288], [21, 251],
+    ];
+
+    const JAWLINE_CONTOUR = [
+      234, 93, 132, 58, 172, 136, 150, 149, 176, 148,
+      152,
+      377, 400, 378, 379, 365, 397, 288, 361, 323, 454,
+    ];
+
+    const RATIO_SPECS = [
+      { ideal: 1.618, weight: 1.2 },
+      { ideal: 1.0,   weight: 1.0 },
+      { ideal: 0.26,  weight: 0.8, deadZone: 0.03 },
+      { ideal: 0.33,  weight: 1.0 },
+      { ideal: 1.618, weight: 0.8 },
+    ];
+
+    function estimateYawAsymmetry(landmarks) {
+      const nose = landmarks[1];
+      const leftJaw = landmarks[234];
+      const rightJaw = landmarks[454];
+      const leftDist = Math.abs(nose.x - leftJaw.x);
+      const rightDist = Math.abs(nose.x - rightJaw.x);
+      const maxDist = Math.max(leftDist, rightDist);
+      if (maxDist < 0.001) return 0;
+      const ratio = Math.min(leftDist, rightDist) / maxDist;
+      return clamp(1 - ratio, 0, 0.5);
+    }
+
+    function estimatePitchAsymmetry(landmarks) {
+      const faceHeight = dist2D(landmarks[10], landmarks[152]);
+      if (faceHeight < 0.001) return 0;
+      const noseFromTop = dist2D(landmarks[10], landmarks[1]);
+      const actualRatio = noseFromTop / faceHeight;
+      return clamp(Math.abs(actualRatio - 0.38), 0, 0.4);
+    }
+
+    function computeSymmetry(landmarks) {
+      const centerX = (landmarks[6].x + landmarks[1].x) / 2;
+      const centerY = (landmarks[6].y + landmarks[1].y) / 2;
+      let totalDeviation = 0;
+
+      for (const [leftIdx, rightIdx] of SYMMETRY_PAIRS) {
+        const leftDistX = Math.abs(landmarks[leftIdx].x - centerX);
+        const rightDistX = Math.abs(landmarks[rightIdx].x - centerX);
+        const maxDistX = Math.max(leftDistX, rightDistX);
+        const leftDistY = landmarks[leftIdx].y - centerY;
+        const rightDistY = landmarks[rightIdx].y - centerY;
+        const yDiff = Math.abs(leftDistY - rightDistY);
+        const faceHeight = Math.abs(landmarks[10].y - landmarks[152].y);
+        const yDeviation = faceHeight > 0.001 ? yDiff / faceHeight : 0;
+        let xDeviation = 0;
+        if (maxDistX > 0.001) {
+          xDeviation = Math.abs(leftDistX - rightDistX) / maxDistX;
+        }
+        totalDeviation += xDeviation * 0.6 + yDeviation * 0.4;
+      }
+
+      const avgDeviation = totalDeviation / SYMMETRY_PAIRS.length;
+      let score = clamp(Math.round(100 * (1 - avgDeviation * 3)), 0, 100);
+      const yawPenalty = estimateYawAsymmetry(landmarks);
+      score = clamp(Math.round(score * (1 - yawPenalty * 0.3)), 0, 100);
+      const pitchPenalty = estimatePitchAsymmetry(landmarks);
+      score = clamp(Math.round(score * (1 - pitchPenalty * 0.3)), 0, 100);
+      return score;
+    }
+
+    function computeProportions(landmarks) {
+      const faceWidth = dist2D(landmarks[234], landmarks[454]);
+      const faceHeight = dist2D(landmarks[10], landmarks[152]);
+      const eyeSpacing = dist2D(landmarks[133], landmarks[362]);
+      const leftEyeWidth = dist2D(landmarks[33], landmarks[133]);
+      const rightEyeWidth = dist2D(landmarks[263], landmarks[362]);
+      const avgEyeWidth = (leftEyeWidth + rightEyeWidth) / 2;
+      const noseWidth = dist2D(landmarks[98], landmarks[327]);
+      const mouthWidth = dist2D(landmarks[61], landmarks[291]);
+      const lowerFace = dist2D(landmarks[2], landmarks[152]);
+
+      const measured = [
+        faceWidth > 0 ? faceHeight / faceWidth : 0,
+        avgEyeWidth > 0 ? eyeSpacing / avgEyeWidth : 0,
+        faceWidth > 0 ? noseWidth / faceWidth : 0,
+        faceHeight > 0 ? lowerFace / faceHeight : 0,
+        noseWidth > 0 ? mouthWidth / noseWidth : 0,
+      ];
+
+      let weightedSum = 0, totalWeight = 0;
+      for (let i = 0; i < RATIO_SPECS.length; i++) {
+        const spec = RATIO_SPECS[i];
+        const rawDev = Math.abs(measured[i] - spec.ideal);
+        const effectiveDev = spec.deadZone ? Math.max(0, rawDev - spec.deadZone) : rawDev;
+        const deviation = effectiveDev / spec.ideal;
+        const score = clamp(100 - deviation * 220, 0, 100);
+        weightedSum += score * spec.weight;
+        totalWeight += spec.weight;
+      }
+      return clamp(Math.round(weightedSum / totalWeight), 0, 100);
+    }
+
+    function computeJawline(landmarks) {
+      const leftAngle = angleDeg(landmarks[132], landmarks[234], landmarks[162]);
+      const rightAngle = angleDeg(landmarks[361], landmarks[454], landmarks[389]);
+      const avgAngle = (leftAngle + rightAngle) / 2;
+      const normalizedAngle = (avgAngle - 120) / 50;
+      const angleScore = clamp(
+        Math.round(100 - Math.pow(Math.max(0, normalizedAngle), 1.6) * 60),
+        0, 100,
+      );
+
+      const contour = JAWLINE_CONTOUR.map(i => landmarks[i]);
+      const curvatures = [];
+      for (let i = 1; i < contour.length - 1; i++) {
+        const dx = contour[i - 1].x - 2 * contour[i].x + contour[i + 1].x;
+        const dy = contour[i - 1].y - 2 * contour[i].y + contour[i + 1].y;
+        curvatures.push(Math.hypot(dx, dy));
+      }
+
+      let smoothnessScore = 100;
+      if (curvatures.length > 0) {
+        const mean = curvatures.reduce((a, b) => a + b, 0) / curvatures.length;
+        const variance = curvatures.reduce((sum, c) => sum + (c - mean) ** 2, 0) / curvatures.length;
+        smoothnessScore = clamp(Math.round(100 - variance * 8000), 0, 100);
+      }
+
+      return clamp(Math.round(angleScore * 0.7 + smoothnessScore * 0.3), 0, 100);
+    }
+
+    function computeFacialThirds(landmarks) {
+      const foreheadY = landmarks[10].y;
+      const browY = (landmarks[107].y + landmarks[336].y) / 2;
+      const noseBaseY = landmarks[2].y;
+      const chinY = landmarks[152].y;
+
+      const rawUpper = Math.abs(browY - foreheadY);
+      const middle = Math.abs(noseBaseY - browY);
+      const lower = Math.abs(chinY - noseBaseY);
+      const upper = rawUpper + middle * 0.2;
+      const total = upper + middle + lower;
+
+      if (total < 0.001) return 0;
+
+      const idealThird = total / 3;
+      const maxDeviation = Math.max(
+        Math.abs(upper - idealThird),
+        Math.abs(middle - idealThird),
+        Math.abs(lower - idealThird),
+      );
+      const deviationPct = maxDeviation / idealThird;
+      const rawScore = clamp(Math.round(100 - deviationPct * 250), 0, 100);
+
+      const pitchPenalty = estimatePitchAsymmetry(landmarks);
+      return clamp(Math.round(rawScore * (1 - pitchPenalty * 0.3)), 0, 100);
+    }
+
+    function computeEyeMetrics(landmarks) {
+      // Canthal tilt
+      const leftTilt = Math.atan2(
+        landmarks[33].y - landmarks[133].y,
+        landmarks[33].x - landmarks[133].x,
+      ) * (180 / Math.PI);
+      const rightTilt = Math.atan2(
+        landmarks[263].y - landmarks[362].y,
+        landmarks[263].x - landmarks[362].x,
+      ) * (180 / Math.PI);
+      const avgTilt = -(leftTilt + rightTilt) / 2;
+      const tiltScore = clamp(Math.round(55 + avgTilt * 4), 0, 100);
+
+      // Aspect ratio
+      const leftHeight = dist2D(landmarks[159], landmarks[145]);
+      const leftWidth = dist2D(landmarks[33], landmarks[133]);
+      const rightHeight = dist2D(landmarks[386], landmarks[374]);
+      const rightWidth = dist2D(landmarks[263], landmarks[362]);
+      const leftAR = leftWidth > 0 ? leftHeight / leftWidth : 0;
+      const rightAR = rightWidth > 0 ? rightHeight / rightWidth : 0;
+      const avgAR = (leftAR + rightAR) / 2;
+      const arDeviation = Math.abs(avgAR - 0.315) / 0.315;
+      const arScore = clamp(Math.round(100 - arDeviation * 250), 0, 100);
+
+      // Inter-eye spacing ratio
+      const eyeSpacing = dist2D(landmarks[133], landmarks[362]);
+      const avgEyeWidth = (leftWidth + rightWidth) / 2;
+      const spacingRatio = avgEyeWidth > 0 ? eyeSpacing / avgEyeWidth : 0;
+      const spacingDev = Math.abs(spacingRatio - 1.0);
+      const spacingScore = clamp(Math.round(100 - spacingDev * 300), 0, 100);
+
+      return clamp(Math.round(tiltScore * 0.4 + arScore * 0.3 + spacingScore * 0.3), 0, 100);
+    }
+
+    function computeAllGeometry(landmarks) {
+      return {
+        symmetry: computeSymmetry(landmarks),
+        proportions: computeProportions(landmarks),
+        jawline: computeJawline(landmarks),
+        facialThirds: computeFacialThirds(landmarks),
+        eyeMetrics: computeEyeMetrics(landmarks),
+      };
+    }
+
+    // =========================================================================
+    // COMPOSITE SCORE  (composite.ts transpiled)
+    // =========================================================================
+
+    const DEFAULT_WEIGHTS = {
+      symmetry: 0.16,
+      proportions: 0.16,
+      skinClarity: 0.19,
+      jawline: 0.14,
+      eyeMetrics: 0.13,
+      facialThirds: 0.08,
+      darkCircles: 0.07,
+      luminosity: 0.07,
+    };
+
+    function computeCompositeScore(geometry, skin) {
+      const w = DEFAULT_WEIGHTS;
+      const skinClarity = (skin.colorUniformity + skin.textureRoughness + skin.blemishDensity) / 3;
+
+      const raw =
+        geometry.symmetry    * w.symmetry +
+        geometry.proportions * w.proportions +
+        skinClarity          * w.skinClarity +
+        geometry.jawline     * w.jawline +
+        geometry.eyeMetrics  * w.eyeMetrics +
+        geometry.facialThirds * w.facialThirds +
+        skin.darkCircles     * w.darkCircles +
+        skin.luminosity      * w.luminosity;
+
+      // Consistency penalty
+      const allScores = [
+        geometry.symmetry, geometry.proportions, geometry.jawline,
+        geometry.eyeMetrics, geometry.facialThirds, skinClarity,
+        skin.darkCircles, skin.luminosity,
+      ];
+      const mean = allScores.reduce((a, b) => a + b, 0) / allScores.length;
+      const variance = allScores.reduce((sum, s) => sum + (s - mean) ** 2, 0) / allScores.length;
+      const stdDev = Math.sqrt(variance);
+      const consistencyMultiplier = clamp(1 - (stdDev ** 2) / 25000, 0.95, 1.0);
+
+      const adjustedRaw = raw * consistencyMultiplier;
+
+      // Sigmoid calibration: raw (0-100) -> final (1-10)
+      const midpoint = 55;
+      const k = 0.07;
+      const sigmoid = 1 / (1 + Math.exp(-k * (adjustedRaw - midpoint)));
+      const overall = Math.round((1 + sigmoid * 9) * 10) / 10;
+
+      return clamp(overall, 1.0, 10.0);
+    }
+
+    // =========================================================================
+    // MEDIAPIPE LOADER
+    // =========================================================================
+
     const CDN = "https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/";
     let faceMesh = null;
 
@@ -84,10 +751,19 @@
       await new Promise(r => { script.onload = r; });
 
       faceMesh = new window.FaceMesh({ locateFile: f => CDN + f });
-      faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+      faceMesh.setOptions({
+        maxNumFaces: 1,
+        refineLandmarks: true,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5,
+      });
       await faceMesh.initialize();
       return faceMesh;
     }
+
+    // =========================================================================
+    // UI HELPERS
+    // =========================================================================
 
     function setStatus(msg, loading = false) {
       const el = document.getElementById('status');
@@ -126,18 +802,80 @@
       container.appendChild(row);
     }
 
-    function renderScores(landmarks) {
+    // =========================================================================
+    // FULL ANALYSIS PIPELINE
+    // =========================================================================
+
+    function runFullAnalysis(landmarks, canvas) {
       document.getElementById('results').style.display = 'block';
 
-      // Compute geometry scores from landmarks
-      const geo = computeGeometry(landmarks);
-      const skin = { colorUniformity: 0, textureRoughness: 0, blemishDensity: 0, darkCircles: 0, luminosity: 0 };
+      // --- Step 1: Geometry scoring ---
+      setStatus('Scoring geometry (symmetry, proportions, jawline, thirds, eyes)...');
+      const geo = computeAllGeometry(landmarks);
 
-      // Composite (geometry only in demo -- skin requires pixel extraction from full library)
-      const geoAvg = Math.round((geo.symmetry + geo.proportions + geo.jawline + geo.facialThirds + geo.eyeMetrics) / 5);
-      const sigmoid = 1 / (1 + Math.exp(-0.10 * (geoAvg - 68)));
-      const overall = (1 + sigmoid * 9).toFixed(1);
-      document.getElementById('overall-score').textContent = overall;
+      // --- Step 2: Extract skin regions from canvas pixels ---
+      setStatus('Extracting skin regions (forehead, cheeks, chin, under-eyes)...');
+      const ctx = canvas.getContext('2d');
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const regions = extractSkinRegions(landmarks, imageData);
+
+      // --- Step 3: White balance normalization ---
+      setStatus('Normalizing white balance (Von Kries chromatic adaptation)...');
+      const wbScales = computeWhiteBalanceScales(regions.forehead);
+      if (wbScales) {
+        applyWhiteBalance(regions.forehead, wbScales);
+        applyWhiteBalance(regions.leftCheek, wbScales);
+        applyWhiteBalance(regions.rightCheek, wbScales);
+        applyWhiteBalance(regions.chin, wbScales);
+        applyWhiteBalance(regions.underEyeLeft, wbScales);
+        applyWhiteBalance(regions.underEyeRight, wbScales);
+      }
+
+      // --- Step 4: Skin scoring ---
+      setStatus('Analyzing skin (CIELAB color uniformity, Laplacian texture, HSV blemish detection)...');
+
+      // Color uniformity: average across cheeks + chin
+      const cuLeft  = computeColorUniformity(regions.leftCheek);
+      const cuRight = computeColorUniformity(regions.rightCheek);
+      const cuChin  = computeColorUniformity(regions.chin);
+      const colorUniformity = Math.round((cuLeft + cuRight + cuChin) / 3);
+
+      // Texture roughness: average across cheeks
+      const trLeft  = computeTextureRoughness(regions.leftCheek);
+      const trRight = computeTextureRoughness(regions.rightCheek);
+      const textureRoughness = Math.round((trLeft + trRight) / 2);
+
+      // Blemish density: average across cheeks + chin + forehead
+      const bdLeft     = computeBlemishDensity(regions.leftCheek);
+      const bdRight    = computeBlemishDensity(regions.rightCheek);
+      const bdChin     = computeBlemishDensity(regions.chin);
+      const bdForehead = computeBlemishDensity(regions.forehead);
+      const blemishDensity = Math.round((bdLeft + bdRight + bdChin + bdForehead) / 4);
+
+      // Dark circles: average left + right under-eye vs cheek reference
+      const cheekAvgL = (averageLightness(regions.leftCheek) + averageLightness(regions.rightCheek)) / 2;
+      const dcLeft  = computeDarkCircles(regions.underEyeLeft, regions.leftCheek, cheekAvgL);
+      const dcRight = computeDarkCircles(regions.underEyeRight, regions.rightCheek, cheekAvgL);
+      const darkCircles = Math.round((dcLeft + dcRight) / 2);
+
+      // Luminosity: average across cheeks
+      const lumLeft  = computeLuminosity(regions.leftCheek);
+      const lumRight = computeLuminosity(regions.rightCheek);
+      const luminosity = Math.round((lumLeft + lumRight) / 2);
+
+      const skin = { colorUniformity, textureRoughness, blemishDensity, darkCircles, luminosity };
+
+      // --- Step 5: Composite score ---
+      setStatus('Computing composite score with sigmoid calibration...');
+      const overall = computeCompositeScore(geo, skin);
+
+      // --- Render ---
+      const overallEl = document.getElementById('overall-score');
+      overallEl.textContent = overall.toFixed(1);
+      // Color the composite score
+      if (overall >= 7) overallEl.style.color = '#4ade80';
+      else if (overall >= 4) overallEl.style.color = '#facc15';
+      else overallEl.style.color = '#f87171';
 
       const geoEl = document.getElementById('geometry-scores');
       const skinEl = document.getElementById('skin-scores');
@@ -150,60 +888,19 @@
       addScoreRow(geoEl, 'Facial Thirds', geo.facialThirds);
       addScoreRow(geoEl, 'Eye Metrics', geo.eyeMetrics);
 
-      // Skin requires pixel-level analysis (full library needed)
-      const skinNote = document.createElement('div');
-      skinNote.style.cssText = 'color:#666;font-size:0.8rem;padding:0.5rem 0';
-      skinNote.textContent = 'Skin analysis requires the full TypeScript library (pixel-level CIELAB + Laplacian processing).';
-      skinEl.appendChild(skinNote);
+      addScoreRow(skinEl, 'Color Uniformity', skin.colorUniformity);
+      addScoreRow(skinEl, 'Texture', skin.textureRoughness);
+      addScoreRow(skinEl, 'Blemish Density', skin.blemishDensity);
+      addScoreRow(skinEl, 'Dark Circles', skin.darkCircles);
+      addScoreRow(skinEl, 'Luminosity', skin.luminosity);
+
+      setStatus('Analysis complete -- 5 geometry + 5 skin + 1 composite score.');
     }
 
-    // Simplified geometry scoring from raw landmarks (mirrors geometry.ts logic)
-    function computeGeometry(lm) {
-      function dist(a, b) {
-        return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
-      }
-      function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+    // =========================================================================
+    // EVENT HANDLERS
+    // =========================================================================
 
-      // Symmetry: compare left/right paired distances
-      const pairs = [[234, 454], [130, 359], [33, 263], [61, 291], [172, 397]];
-      let symSum = 0;
-      for (const [l, r] of pairs) {
-        const dL = dist(lm[l], lm[4]); // distance to nose tip
-        const dR = dist(lm[r], lm[4]);
-        const ratio = Math.min(dL, dR) / Math.max(dL, dR);
-        symSum += ratio;
-      }
-      const symmetry = clamp(Math.round((symSum / pairs.length) * 100), 0, 100);
-
-      // Proportions: face width/height ratio vs golden ratio
-      const faceW = dist(lm[234], lm[454]);
-      const faceH = dist(lm[10], lm[152]);
-      const ratio = faceH / faceW;
-      const goldenDev = Math.abs(ratio - 1.618);
-      const proportions = clamp(Math.round((1 - goldenDev / 0.5) * 100), 0, 100);
-
-      // Jawline: angle at jaw corners
-      const jawL = lm[172], jawR = lm[397], chin = lm[152];
-      const angle = Math.atan2(chin.y - jawL.y, chin.x - jawL.x) - Math.atan2(jawR.y - jawL.y, jawR.x - jawL.x);
-      const angleDeg = Math.abs(angle * 180 / Math.PI);
-      const jawline = clamp(Math.round(100 - Math.abs(angleDeg - 120) * 1.5), 0, 100);
-
-      // Facial thirds
-      const topY = lm[10].y, midY = lm[4].y, botY = lm[152].y;
-      const upper = midY - topY, lower = botY - midY;
-      const thirdsRatio = Math.min(upper, lower) / Math.max(upper, lower);
-      const facialThirds = clamp(Math.round(thirdsRatio * 100), 0, 100);
-
-      // Eye metrics: width/height ratio
-      const eyeW = dist(lm[33], lm[133]);
-      const eyeH = dist(lm[159], lm[145]);
-      const eyeRatio = eyeW / Math.max(eyeH, 0.001);
-      const eyeMetrics = clamp(Math.round(100 - Math.abs(eyeRatio - 3.0) * 15), 0, 100);
-
-      return { symmetry, proportions, jawline, facialThirds, eyeMetrics };
-    }
-
-    // Upload handler
     document.getElementById('btn-upload').addEventListener('click', () => {
       document.getElementById('file-input').click();
     });
@@ -230,8 +927,7 @@
       model.onResults((results) => {
         if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
           const landmarks = results.multiFaceLandmarks[0];
-          setStatus('Scoring geometry (symmetry, proportions, jawline, thirds, eyes)...');
-          setTimeout(() => renderScores(landmarks), 100);
+          setTimeout(() => runFullAnalysis(landmarks, canvas), 50);
         } else {
           setStatus('No face detected. Try a clearer photo with good lighting and a front-facing angle.');
         }
